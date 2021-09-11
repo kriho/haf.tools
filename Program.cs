@@ -10,6 +10,8 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
+using SharpVectors.Converters;
+using SharpVectors.Renderers.Wpf;
 
 namespace HAF.Tools {
 
@@ -27,20 +29,99 @@ namespace HAF.Tools {
   class Program {
 
     public static int Main(string[] args) {
-      var verb = Parser.Default.ParseArguments<LocalizeVerb>(args);
+      var verb = Parser.Default.ParseArguments<LocalizeVerb, IconsConvertVerb, IconsMergeVerb>(args);
       try {
-        _ = verb.WithParsed(Program.Localize);
+        _ = verb.WithParsed<LocalizeVerb>(Program.Localize);
+        _ = verb.WithParsed<IconsConvertVerb>(Program.ConvertIcons);
+        _ = verb.WithParsed<IconsMergeVerb>(Program.MergeIcons);
         return 0;
-      } catch (Exception e) {
+      } catch(Exception e) {
         Console.WriteLine(e.Message);
         return 1;
       }
     }
 
+    private static void ConvertIcons(IconsConvertVerb options) {
+      var outputDirectoryInfo = new System.IO.DirectoryInfo(options.OutputDirectory);
+      var sourceDirectoryInfo = new System.IO.DirectoryInfo(options.SourceDirectory);
+      // create conversion options
+      var settings = new WpfDrawingSettings {
+        IncludeRuntime = false,
+        TextAsGeometry = false,
+        OptimizePath = true,
+      };
+      foreach(var fileInfo in outputDirectoryInfo.GetFiles("*.*", System.IO.SearchOption.AllDirectories)) {
+        fileInfo.Delete();
+      }
+      // create a directory converter
+      var converter = new FileSvgConverter(settings) {
+        SaveXaml = true
+      };
+      // perform the conversion to XAML
+      void convertSubdirectories(System.IO.DirectoryInfo directoryInfo) {
+        foreach(var fileInfo in directoryInfo.EnumerateFiles()) {
+          var targetFilePath = fileInfo.FullName.Replace(sourceDirectoryInfo.FullName, outputDirectoryInfo.FullName).Replace(".svg", ".xaml");
+          var document = XDocument.Load(fileInfo.FullName);
+          var modified = false;
+          foreach(var p in document.Descendants().Where(d => d.Attribute("fill")?.Value == "none" && d.Attribute("stroke") == null)) {
+            p.SetAttributeValue("stroke", "currentColor");
+            modified = true;
+          }
+          foreach(var p in document.Descendants().Where(d => d.Attribute("fill") == null && d.Attribute("stroke") == null && d.Attribute("stroke-linecap") != null && d.Attribute("stroke-width")?.Value != "0")) {
+            p.SetAttributeValue("stroke", "currentColor");
+            p.SetAttributeValue("fill", "none");
+            modified = true;
+          }
+          var success = false;
+          if(modified) {
+            var temporaryFilePath = System.IO.Path.GetTempFileName();
+            document.Save(temporaryFilePath);
+            success = converter.Convert(temporaryFilePath, targetFilePath);
+          } else {
+            success = converter.Convert(fileInfo.FullName, targetFilePath);
+          }
+          if(!success || converter.WriterErrorOccurred) {
+            throw new Exception("writer error ocurred");
+          }
+        }
+        foreach(var subDirectoryInfo in directoryInfo.EnumerateDirectories()) {
+          convertSubdirectories(subDirectoryInfo);
+        }
+      }
+      convertSubdirectories(sourceDirectoryInfo);
+    }
+
+    private static void MergeIcons(IconsMergeVerb options) {
+      var sourceDirectoryInfo = new System.IO.DirectoryInfo(options.SourceDirectory);
+      // add drawings to dictionary
+      var dictionaryDocument = XDocument.Load(options.ResourceDictionaryFilePath);
+      dictionaryDocument.Root.RemoveNodes();
+      var keys = new List<string>();
+      XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+      XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+      foreach(var fileInfo in sourceDirectoryInfo.GetFiles("*.xaml", System.IO.SearchOption.AllDirectories)) {
+        var document = XDocument.Load(fileInfo.FullName);
+        // do not use root
+        var root = document.Root.Element(xaml + "DrawingGroup");
+        root.RemoveAttributes();
+        var entry = string.Join("", fileInfo.Name.Replace(".xaml", "").Replace("'", "").Replace(",", "").Replace("+", "Plus").Replace(".", "Dot").Split('-').Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Substring(0, 1).ToUpper() + s.Substring(1)));
+        var category = string.Join("", fileInfo.DirectoryName.Replace(sourceDirectoryInfo.FullName, "").Replace("'", "").Replace(",", "").Replace("+", "Plus").Replace(".", "Dot").Split('/', '\\', '-').Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Substring(0, 1).ToUpper() + s.Substring(1)));
+        var key = category + "_" + entry;
+        root.Add(new XAttribute(x + "Key", "Icon" + key));
+        dictionaryDocument.Root.Add(root);
+        keys.Add(key + ",");
+      }
+      if(keys.Count != keys.Distinct().Count()) {
+        throw new Exception("keys are not unique");
+      }
+      dictionaryDocument.Save(options.ResourceDictionaryFilePath);
+      System.IO.File.WriteAllText(options.KeysFilePath, string.Join("\r\n", keys));
+    }
+
     private static void Localize(LocalizeVerb options) {
       var directoyInfo = new System.IO.DirectoryInfo(options.SourceDirectory);
       var texts = new List<LocalizableTextInfo>();
-      foreach (var fileInfo in directoyInfo.EnumerateFiles("*.cs", System.IO.SearchOption.AllDirectories)) {
+      foreach(var fileInfo in directoyInfo.EnumerateFiles("*.cs", System.IO.SearchOption.AllDirectories)) {
         texts.AddRange(ExtractFromCSharp(fileInfo.FullName));
       }
       foreach(var fileInfo in directoyInfo.EnumerateFiles("*.xaml", System.IO.SearchOption.AllDirectories)) {
@@ -83,7 +164,7 @@ namespace HAF.Tools {
     private static IEnumerable<LocalizableTextInfo> ExtractFromCSharp(string filePath) {
       var fileContent = System.IO.File.ReadAllText(filePath);
       var syntaxTree = CSharpSyntaxTree.ParseText(fileContent);
-      if (syntaxTree.GetDiagnostics().Any(d => d.Severity >= DiagnosticSeverity.Error)) {
+      if(syntaxTree.GetDiagnostics().Any(d => d.Severity >= DiagnosticSeverity.Error)) {
         throw new InvalidOperationException($"the file \"{filePath}\" contains errors");
       }
       var argumentList = syntaxTree.GetRoot().DescendantNodes()
